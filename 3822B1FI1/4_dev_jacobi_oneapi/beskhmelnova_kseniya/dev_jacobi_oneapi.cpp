@@ -26,34 +26,51 @@ std::vector<float> JacobiDevONEAPI(
     q.memcpy(d_a, a.data(), sizeof(float) * n * n);
     q.memcpy(d_b, b.data(), sizeof(float) * n);
     q.memcpy(d_inv, inv_diag.data(), sizeof(float) * n);
-    q.fill(d_x_curr, 0.0f, n).wait();
+    q.fill(d_x_curr, 0.0f, n);
 
-    const size_t wg_size = std::min<size_t>(
-        device.is_gpu() ? 128 : 256,
-        device.get_info<sycl::info::device::max_work_group_size>()
-    );
-
-    const int CHECK_INTERVAL = 4;
+    const size_t wg_size = 64;
+    const size_t global_size = ((n + wg_size - 1) / wg_size) * wg_size;
+    
     bool converged = false;
+    const int CHECK_INTERVAL = 8;
+    
     std::vector<float> x_host(n);
+    std::vector<float> x_prev(n, 0.0f);
 
     for (int iter = 0; iter < ITERATIONS && !converged; iter++) {
-        q.parallel_for(sycl::nd_range<1>(
-            sycl::range<1>(((n + wg_size - 1) / wg_size) * wg_size),
-            sycl::range<1>(wg_size)
-        ), [=](sycl::nd_item<1> item) {
-            size_t i = item.get_global_id(0);
-            if (i >= static_cast<size_t>(n)) return;
+        q.parallel_for(sycl::nd_range<1>(global_size, wg_size),
+            [=](sycl::nd_item<1> item) {
+                size_t i = item.get_global_id(0);
+                if (i >= static_cast<size_t>(n)) return;
 
-            float sum = 0.0f;
-            const size_t row_start = i * n;
-            for (int j = 0; j < n; j++) {
-                if (j != static_cast<int>(i)) {
-                    sum += d_a[row_start + j] * d_x_curr[j];
+                float sum = 0.0f;
+                const size_t row_start = i * n;
+
+                #pragma unroll(4)
+                for (int j = 0; j < n; j++) {
+                    if (j != static_cast<int>(i)) {
+                        sum += d_a[row_start + j] * d_x_curr[j];
+                    }
                 }
+                d_x_next[i] = d_inv[i] * (d_b[i] - sum);
+            });
+
+        if ((iter + 1) % CHECK_INTERVAL == 0) {
+            q.memcpy(x_host.data(), d_x_next, sizeof(float) * n).wait();
+            
+            float norm_sq = 0.0f;
+            for (int i = 0; i < n; i++) {
+                float diff = x_host[i] - x_prev[i];
+                norm_sq += diff * diff;
             }
-            d_x_next[i] = d_inv[i] * (d_b[i] - sum);
-        });
+            
+            if (norm_sq < accuracy_sq) {
+                converged = true;
+                break;
+            }
+            
+            x_prev = x_host;
+        }
 
         std::swap(d_x_curr, d_x_next);
     }
